@@ -5,8 +5,26 @@
   "license": "Apache-2.0",
   "type": "module",
   "main": "src/index.js",
-  "exports": { ".": "./src/index.js", "./benchmark": "./src/benchmark.js" },
-  "keywords": ["agent", "doctrine", "grounded", "role-play", "benchmark", "verification", "llm"],
+  "exports": {
+    ".": "./src/index.js",
+    "./benchmark": "./src/benchmark.js",
+    "./grounding": "./src/grounding.js"
+  },
+  "bin": { "understudy": "src/cli.js" },
+  "keywords": [
+    "agent",
+    "doctrine",
+    "grounded",
+    "grounding",
+    "role-play",
+    "benchmark",
+    "verification",
+    "validation",
+    "fidelity",
+    "llm",
+    "rag",
+    "llm-judge"
+  ],
   "author": "jeranaias",
   "engines": { "node": ">=18" },
   "repository": { "type": "git", "url": "git+https://github.com/jeranaias/understudy.git" },
