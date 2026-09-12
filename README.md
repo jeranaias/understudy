@@ -37,13 +37,19 @@ await respond({ persona: 'an adversary logistics cell', doctrine, situation: 'Ca
 //     inDoctrine: false, note: 'out_of_doctrine', citations: [], grounding: { grounded: false, score: 0 } }
 ```
 
-Tighten the leash one more notch with **strict mode** — even an on-topic answer is downgraded to a
-refusal if it can't be sufficiently grounded in the passages it cited:
+Tighten the leash one more notch with **strict mode**. A strict answer is kept as in-doctrine only if it
+clears the *whole* gate: the model did **not** itself flag the situation out-of-doctrine, the answer is
+non-empty and actually cites a passage, **and** its grounding score is at or above `groundingThreshold`.
+Anything short of that is downgraded to a refusal:
 
 ```js
 await respond({ persona, doctrine, situation, strict: true, groundingThreshold: 0.3 });
 // weakly-grounded → { action: 'No action taken.', inDoctrine: false, note: 'weak_grounding', … }
 ```
+
+The `0.3` default is deliberately low. The grounding proxy is lexical (stem-tolerant overlap of the
+answer with its citations), so a faithful paraphrase can still score modestly; `0.3` catches wholesale
+drift into un-cited vocabulary without punishing honest rewording. Raise it for a tighter leash.
 
 ## Prove the fidelity (V&V)
 
@@ -61,10 +67,16 @@ const cases = [
 ];
 
 const { report, runs } = await benchmark(cases, { persona: 'an adversary logistics cell', doctrine });
-// report → { n: 1, conforming: 1, fidelity: 1, groundedRate: 1, meanGrounding: 0.44,
-//            byVerdict: { 'in-doctrine': 1, partial: 0, 'off-doctrine': 0 }, failures: [] }
-// runs   → [{ id, response, verdict, conforms, reasons, grounded, groundingScore }]
+// report → { n: 1, scored: 1, errored: 0, conforming: 1, fidelity: 1, groundedRate: 1, meanGrounding: 0.44,
+//            byVerdict: { 'in-doctrine': 1, partial: 0, 'off-doctrine': 0, unknown: 0 }, failures: [] }
+// runs   → [{ id, response, verdict, conforms, reasons, errored, grounded, groundingScore }]
 ```
+
+The judge defaults to a **different model than the agent** (independence — scoring an agent with its own
+weights would launder its blind spots into the grade) and sees only the **retrieved subset the agent
+cited** plus its rationale, not the whole doctrine corpus. A run whose model/network call fails is marked
+`errored` and **excluded from the fidelity denominator** (`scored = n - errored`) rather than miscounted
+as a doctrine failure — so the fidelity number reflects doctrine conformance, not flaky infrastructure.
 
 The aggregator and the grounding proxy are **pure** — no key, fully unit-tested — so you can grade and
 brief from them anywhere:
@@ -80,7 +92,8 @@ fidelityReport([
   { verdict: 'in-doctrine', grounded: true, groundingScore: 0.7 },
   { verdict: 'off-doctrine', grounded: false, groundingScore: 0.1, reasons: 'invented a capability' },
 ]);
-// → { n: 2, conforming: 1, fidelity: 0.5, groundedRate: 0.5, meanGrounding: 0.4, byVerdict: {…}, failures: [{…}] }
+// → { n: 2, scored: 2, errored: 0, conforming: 1, fidelity: 0.5, groundedRate: 0.5, meanGrounding: 0.4,
+//     byVerdict: {…}, failures: [{…}] }
 ```
 
 ### Why fidelity, not vibes
@@ -104,14 +117,20 @@ code, and defend the result instead of asserting it.
 
 ```ts
 {
-  action: string,               // what the entity does / decides ('No action taken.' on a refusal)
+  action: string,               // what the entity does / decides ('No action taken.' on any refusal or error)
   rationale: string,            // why, per the doctrine, with [n] cites
-  inDoctrine: boolean,          // false on any refusal
-  note: string,                 // '' | 'out_of_doctrine' | 'weak_grounding' | an error string
+  inDoctrine: boolean,          // false on any refusal or error
+  errored: boolean,             // true ONLY for a model/network/input error — distinct from a refusal
+  note: string,                 // '' | 'out_of_doctrine' | 'weak_grounding' | 'invalid_k' | an error string
   citations: { source: string, text: string }[],
   grounding: { grounded: boolean, score: number }   // overlap of the answer with its citations, 0..1
 }
 ```
+
+A **refusal** (`errored: false`) is a deliberate decline — the doctrine doesn't grant it. An **error**
+(`errored: true`) is a failed model/network call or bad input; both use `action: 'No action taken.'`, but
+only the error is excluded from the benchmark's fidelity denominator. An empty `doctrine: []` grants
+nothing, so `respond` **refuses** (it does not throw); passing neither `doctrine` nor `retriever` throws.
 
 ## API
 
@@ -120,11 +139,11 @@ code, and defend the result instead of asserting it.
 | `respond({ persona, doctrine \| retriever, situation, k?, strict?, groundingThreshold? })` | async | The stand-in acts on a situation, grounded in doctrine; refuses out of doctrine. |
 | `doctrineRetriever(doctrine)` | sync → fn | Zero-dependency keyword retriever; `(query, k=5) => passages`. |
 | `groundResponse(raw, passages, { strict?, groundingThreshold? })` | **pure** | Turn a raw model decision into the final grounded response (citations + strict gate). Compose your own pipeline. |
-| `benchmark(cases, { persona, doctrine \| retriever, k?, strict?, groundingThreshold?, judge? })` | async | Run the agent over cases, judge conformance, aggregate a fidelity report. |
+| `benchmark(cases, { persona, doctrine \| retriever, k?, strict?, groundingThreshold?, judge?, chat? })` | async | Run the agent over cases, judge conformance, aggregate a fidelity report. Per-case isolated: one throwing case is marked `errored` and never aborts the run. |
 | `scoreCase({ situation, response, expect, doctrine? })` | async | The LLM judge for one case (inject your own into `benchmark` for offline scoring). |
 | `fidelityReport(results)` | **pure** | Aggregate scored cases into the fidelity summary. |
 | `checkGrounding(text, citations, { threshold? })` | **pure** | Groundedness proxy: fraction of the answer's words found in its citations. |
-| `normalizeVerdict(v)` | **pure** | Normalize a judge verdict onto `in-doctrine \| partial \| off-doctrine`. |
+| `normalizeVerdict(v)` | **pure** | Normalize a judge verdict onto `in-doctrine \| partial \| off-doctrine`; an unrecognizable verdict returns `unknown` (flagged, never silently bucketed as `partial`). |
 
 Bring your own retriever (e.g. a vector store) via `retriever: (query, k) => Promise<passages>` instead
 of `doctrine`. Inject a deterministic `judge: (c) => ({ verdict, reasons? })` to run the benchmark with
@@ -148,7 +167,11 @@ Model calls go to any OpenAI-compatible chat-completions endpoint.
 | --- | --- | --- |
 | `UNDERSTUDY_API_KEY` | — | API key (`OPENROUTER_API_KEY` is also accepted). |
 | `UNDERSTUDY_ENDPOINT` | `https://openrouter.ai/api/v1/chat/completions` | Chat-completions URL. |
-| `UNDERSTUDY_MODEL` | `google/gemini-3-flash-preview` | Model id. |
+| `UNDERSTUDY_MODEL` | `google/gemini-3-flash-preview` | The **agent** model id (called at `temperature: 0` for reproducibility). |
+| `UNDERSTUDY_JUDGE_MODEL` | `openai/gpt-4o-mini` | The **judge** model id — defaults to a different model than the agent for independent scoring. |
+
+Both `respond` and `scoreCase` accept an injected `chat(system, user) => Promise<parsedJSON>` so the
+model paths are testable (and provider-swappable) with no network.
 
 ## Install & test
 

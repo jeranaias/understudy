@@ -38,7 +38,12 @@ export function doctrineRetriever(doctrine) {
   };
 }
 
-async function chat(system, user, timeoutMs = 45000) {
+/**
+ * The default model call — an OpenAI-compatible chat completion. Injectable: pass your own
+ * `chat(system, user) => Promise<parsedJSON|{error}>` into {@link respond} to test the model path
+ * (or swap providers) with no network. `temperature: 0` keeps the stand-in reproducible.
+ */
+async function callModel(system, user, timeoutMs = 45000) {
   const KEY = process.env.UNDERSTUDY_API_KEY || process.env.OPENROUTER_API_KEY;
   if (!KEY) return { error: 'set UNDERSTUDY_API_KEY (or OPENROUTER_API_KEY)' };
   try {
@@ -48,7 +53,7 @@ async function chat(system, user, timeoutMs = 45000) {
       headers: { Authorization: `Bearer ${KEY}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({
         model: MODEL,
-        temperature: 0.2,
+        temperature: 0,
         messages: [
           { role: 'system', content: system },
           { role: 'user', content: user },
@@ -72,12 +77,29 @@ async function chat(system, user, timeoutMs = 45000) {
   }
 }
 
-/** The refusal every out-of-doctrine path returns. @param {string} note @returns {object} */
+/** The refusal every out-of-doctrine path returns. A refusal is a *deliberate* decline, not an error
+ * (`errored: false`). @param {string} note @returns {object} */
 function refusal(note, rationale) {
   return {
     action: 'No action taken.',
     rationale: rationale || 'The doctrine does not address this situation.',
     inDoctrine: false,
+    errored: false,
+    note,
+    citations: [],
+    grounding: { grounded: false, score: 0 },
+  };
+}
+
+/** A model/network/input error — shape-compatible with a refusal (`action: 'No action taken.'` per the
+ * documented contract) but flagged `errored: true` so the benchmark can EXCLUDE it from the fidelity
+ * denominator instead of miscounting it as a doctrine failure. @param {string} note @returns {object} */
+function errorResponse(note, rationale) {
+  return {
+    action: 'No action taken.',
+    rationale: rationale || '',
+    inDoctrine: false,
+    errored: true,
     note,
     citations: [],
     grounding: { grounded: false, score: 0 },
@@ -93,31 +115,36 @@ function refusal(note, rationale) {
  *   the model's parsed decision
  * @param {{text:string, source?:string}[]} passages  the retrieved passages the model saw, in order
  * @param {{ strict?:boolean, groundingThreshold?:number }} [opts]
- *   `strict` downgrades a would-be in-doctrine answer to a refusal when its grounding score falls below
- *   `groundingThreshold` (default 0.3) — the leash tightened one more notch.
- * @returns {{action:string, rationale:string, inDoctrine:boolean, note:string,
+ *   `strict` refuses a would-be in-doctrine answer unless it clears the whole gate: the model did NOT
+ *   itself flag `outOfDoctrine`, the answer is non-empty and actually cites a passage, AND its grounding
+ *   score is at or above `groundingThreshold` (default 0.3). The 0.3 floor is deliberately low — the
+ *   proxy is lexical, so a well-grounded paraphrase can still score modestly; 0.3 catches wholesale
+ *   drift into un-cited vocabulary without punishing honest rewording. Raise it for a tighter leash.
+ * @returns {{action:string, rationale:string, inDoctrine:boolean, errored:boolean, note:string,
  *   citations:{source:string, text:string}[], grounding:{grounded:boolean, score:number}}}
  */
 export function groundResponse(raw, passages, opts = {}) {
   const top = Array.isArray(passages) ? passages : [];
   const out = raw || {};
-  if (out.error) return { action: '', rationale: '', inDoctrine: false, note: out.error, citations: [], grounding: { grounded: false, score: 0 } };
+  if (out.error) return errorResponse(out.error);
   if (out.outOfDoctrine) return refusal(out.note || 'out_of_doctrine', out.rationale);
 
   const used = (Array.isArray(out.used) ? out.used : []).map((n) => top[n - 1]).filter(Boolean);
   const cite = used.length ? used : top.slice(0, 2);
   const citations = cite.map((d) => ({ source: d.source || 'doctrine', text: d.text }));
-  const action = out.action || '';
+  const action = (out.action || '').trim();
   const rationale = out.rationale || '';
   const grounding = checkGrounding(`${action} ${rationale}`, citations, { threshold: opts.groundingThreshold });
 
-  if (opts.strict && !grounding.grounded) {
+  // Strict gate: enforce, don't caveat. A strict in-doctrine answer must be non-empty, cite doctrine,
+  // and be lexically grounded — otherwise it is downgraded to a refusal.
+  if (opts.strict && (!grounding.grounded || !action || !citations.length)) {
     return {
       ...refusal('weak_grounding', 'The response could not be sufficiently grounded in the cited doctrine.'),
       grounding,
     };
   }
-  return { action, rationale, inDoctrine: true, note: out.note || '', citations, grounding };
+  return { action: out.action || '', rationale, inDoctrine: true, errored: false, note: out.note || '', citations, grounding };
 }
 
 /**
@@ -134,15 +161,27 @@ export function groundResponse(raw, passages, opts = {}) {
  * @param {number} [args.k=5]  how many passages to retrieve
  * @param {boolean} [args.strict=false]  refuse when the answer's grounding score is below threshold
  * @param {number} [args.groundingThreshold=0.3]  the strict-mode grounding floor
- * @returns {Promise<{action:string, rationale:string, inDoctrine:boolean, note:string,
+ * @param {(system:string, user:string)=>Promise<object>} [args.chat]  inject a model call (for tests /
+ *   alternate providers); defaults to the built-in OpenAI-compatible completion
+ * @returns {Promise<{action:string, rationale:string, inDoctrine:boolean, errored:boolean, note:string,
  *   citations:{source:string, text:string}[], grounding:{grounded:boolean, score:number}}>}
  */
-export async function respond({ persona, doctrine, retriever, situation, k = 5, strict = false, groundingThreshold } = {}) {
+export async function respond({ persona, doctrine, retriever, situation, k = 5, strict = false, groundingThreshold, chat = callModel } = {}) {
   if (!persona || typeof persona !== 'string') throw new TypeError('respond: persona (string) required');
   if (!situation || typeof situation !== 'string') throw new TypeError('respond: situation (string) required');
   if (retriever != null && typeof retriever !== 'function') throw new TypeError('respond: retriever must be a function');
-  const retrieve = retriever || (doctrine?.length ? doctrineRetriever(doctrine) : null);
-  if (!retrieve) throw new TypeError('respond: provide { doctrine } or { retriever }');
+  if (typeof chat !== 'function') throw new TypeError('respond: chat must be a function');
+  // A bad k must surface as an error, never silently truncate retrieval to 0 (which masquerades as a
+  // legitimate out-of-doctrine refusal).
+  if (!Number.isFinite(k) || k < 0) return errorResponse('invalid_k', 'k must be a finite, non-negative number.');
+
+  let retrieve = retriever;
+  if (!retrieve) {
+    if (doctrine == null) throw new TypeError('respond: provide { doctrine } or { retriever }');
+    // An empty doctrine grants nothing — REFUSE (nothing is permitted), do not throw.
+    if (Array.isArray(doctrine) && doctrine.length === 0) return refusal('out_of_doctrine');
+    retrieve = doctrineRetriever(doctrine); // validates array-ness; throws on a non-array
+  }
 
   const top = await retrieve(situation, k);
   if (!Array.isArray(top) || !top.length) return refusal('out_of_doctrine');

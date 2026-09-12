@@ -1,8 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { doctrineRetriever, respond, groundResponse } from '../src/understudy.js';
-import { fidelityReport, checkGrounding, benchmark, scoreCase, normalizeVerdict, VERDICTS } from '../src/benchmark.js';
-import { tokenize } from '../src/grounding.js';
+import { fidelityReport, checkGrounding, benchmark, scoreCase, normalizeVerdict, VERDICTS, UNKNOWN } from '../src/benchmark.js';
+import { tokenize, stem } from '../src/grounding.js';
 
 const doctrine = [
   { text: 'Supply convoys move only during daylight and always with an armed escort.', source: 'SOP 3.1' },
@@ -81,8 +81,8 @@ test('normalizeVerdict maps the canonical and drifted forms', () => {
   assert.equal(normalizeVerdict('conforms'), 'in-doctrine');
   assert.equal(normalizeVerdict('out of doctrine'), 'off-doctrine');
   assert.equal(normalizeVerdict('fail'), 'off-doctrine');
-  assert.equal(normalizeVerdict('who knows'), 'partial');
-  assert.equal(normalizeVerdict(undefined), 'partial');
+  assert.equal(normalizeVerdict('who knows'), 'unknown');
+  assert.equal(normalizeVerdict(undefined), 'unknown');
   for (const v of VERDICTS) assert.equal(normalizeVerdict(v), v);
 });
 
@@ -130,7 +130,8 @@ test('fidelityReport leaves groundedRate null when no grounded flags are present
 test('fidelityReport normalizes unknown verdicts and throws on non-arrays', () => {
   const rep = fidelityReport([{ id: 'a', verdict: 'CONFORMS' }, { id: 'b', verdict: 'weird' }]);
   assert.equal(rep.conforming, 1);
-  assert.equal(rep.byVerdict.partial, 1);
+  assert.equal(rep.byVerdict.unknown, 1); // 'weird' is flagged unknown, not silently bucketed as partial
+  assert.equal(rep.byVerdict.partial, 0);
   assert.throws(() => fidelityReport('nope'), TypeError);
   assert.throws(() => fidelityReport(null), TypeError);
 });
@@ -214,7 +215,7 @@ test('benchmark validates inputs', async () => {
 
 test('benchmark runs offline with an injected judge and aggregates multiple cases', async () => {
   // empty-retrieving doctrine forces the out-of-doctrine agent path (no model); injected judge scores it
-  const doc = [{ text: 'totally unrelated content about gardening', source: 'X' }];
+  const doc = [{ text: 'gardening notes about roses and tulips', source: 'X' }];
   const calls = [];
   const fakeJudge = async ({ situation, response }) => {
     calls.push({ situation, response });
@@ -239,24 +240,189 @@ test('benchmark runs offline with an injected judge and aggregates multiple case
 test('benchmark normalizes a drifted judge verdict', async () => {
   const { runs } = await benchmark(
     [{ id: '1', situation: 'unrelated xyz', expect: 'nothing' }],
-    { persona: 'a cell', doctrine: [{ text: 'unrelated gardening' }], judge: async () => ({ verdict: 'CONFORMS' }) },
+    { persona: 'a cell', doctrine: [{ text: 'gardening notes about roses' }], judge: async () => ({ verdict: 'CONFORMS' }) },
   );
   assert.equal(runs[0].verdict, 'in-doctrine');
 });
 
 // ── scoreCase (no key path) ──────────────────────────────────────────────────
-test('scoreCase returns an off-doctrine error verdict when no model key is set', async () => {
+test('scoreCase returns an errored (not off-doctrine) verdict when no model key is set', async () => {
   const prevA = process.env.UNDERSTUDY_API_KEY;
   const prevB = process.env.OPENROUTER_API_KEY;
   delete process.env.UNDERSTUDY_API_KEY;
   delete process.env.OPENROUTER_API_KEY;
   try {
     const r = await scoreCase({ situation: 's', response: 'r', expect: 'e', doctrine });
-    assert.equal(r.verdict, 'off-doctrine');
+    assert.equal(r.verdict, 'unknown'); // a judge model error is errored, NOT a fabricated off-doctrine
+    assert.equal(r.errored, true);
     assert.equal(r.conforms, false);
     assert.match(r.reasons, /UNDERSTUDY_API_KEY/);
   } finally {
     if (prevA !== undefined) process.env.UNDERSTUDY_API_KEY = prevA;
     if (prevB !== undefined) process.env.OPENROUTER_API_KEY = prevB;
   }
+});
+
+// ── HARDENING: normalizeVerdict whitespace + expanded synonyms ─────────────────
+test('normalizeVerdict trims BEFORE dashing so leading/trailing space keeps the verdict', () => {
+  assert.equal(normalizeVerdict(' in-doctrine'), 'in-doctrine'); // was mis-bucketed to partial
+  assert.equal(normalizeVerdict('in-doctrine '), 'in-doctrine');
+  assert.equal(normalizeVerdict('  off doctrine  '), 'off-doctrine');
+  assert.equal(normalizeVerdict('-in-doctrine-'), 'in-doctrine');
+});
+
+test('normalizeVerdict recognizes off/in synonyms instead of swallowing them as partial', () => {
+  for (const off of ['non-conforming', 'noncompliant', 'violation', 'violates', 'breach', 'rejected', 'no'])
+    assert.equal(normalizeVerdict(off), 'off-doctrine', off);
+  for (const inn of ['compliant', 'yes', 'conforms', 'passed', 'accepted'])
+    assert.equal(normalizeVerdict(inn), 'in-doctrine', inn);
+  assert.equal(normalizeVerdict('partially'), 'partial');
+  assert.equal(normalizeVerdict('banana'), UNKNOWN); // genuinely unknown is flagged, not partial
+});
+
+// ── HARDENING: error vs. refusal disambiguation + benchmark denominator ────────
+test('groundResponse marks a model error errored:true with the contract action, refusal errored:false', () => {
+  const err = groundResponse({ error: 'HTTP 500' }, passages);
+  assert.equal(err.errored, true);
+  assert.equal(err.inDoctrine, false);
+  assert.equal(err.action, 'No action taken.'); // documented contract, was '' before
+  assert.equal(err.note, 'HTTP 500');
+
+  const ref = groundResponse({ outOfDoctrine: true, note: 'out_of_doctrine' }, passages);
+  assert.equal(ref.errored, false); // a deliberate refusal is not an error
+  assert.equal(ref.action, 'No action taken.');
+});
+
+test('fidelityReport EXCLUDES errored runs from the fidelity denominator', () => {
+  const rep = fidelityReport([
+    { id: 'a', verdict: 'in-doctrine' },
+    { id: 'b', verdict: 'off-doctrine', reasons: 'drift' },
+    { id: 'e', errored: true, verdict: UNKNOWN, reasons: 'HTTP 500' },
+  ]);
+  assert.equal(rep.n, 3);
+  assert.equal(rep.errored, 1);
+  assert.equal(rep.scored, 2);
+  assert.equal(rep.fidelity, 0.5); // 1 of 2 scored, NOT 1 of 3
+  assert.equal(rep.failures.length, 1); // the errored run is not a doctrine failure
+  assert.equal(rep.byVerdict.unknown, 0); // errored run excluded from the verdict tally
+});
+
+test('benchmark counts an agent model error as errored, never as an off-doctrine failure', async () => {
+  const erroringChat = async () => ({ error: 'HTTP 503' });
+  const { report, runs } = await benchmark(
+    [{ id: '1', situation: 'a supply convoy at night', expect: 'hold until daylight' }],
+    { persona: 'a cell', doctrine, chat: erroringChat, judge: async () => ({ verdict: 'off-doctrine' }) },
+  );
+  assert.equal(runs[0].errored, true);
+  assert.equal(report.errored, 1);
+  assert.equal(report.scored, 0);
+  assert.equal(report.fidelity, 0);
+  assert.equal(report.failures.length, 0); // errored, not scored off-doctrine
+});
+
+// ── HARDENING: unicode tokenizer + stem-tolerant grounding ─────────────────────
+test('tokenize keeps non-English (accented Latin, Cyrillic, Arabic) tokens', () => {
+  assert.deepEqual(tokenize('El convoy avanza al mediodía con escolta'), ['convoy', 'avanza', 'mediodía', 'con', 'escolta']);
+  assert.deepEqual(tokenize('Конвой движется днём'), ['конвой', 'движется', 'днём']);
+  assert.deepEqual(tokenize('القافلة تتحرك نهارا'), ['القافلة', 'تتحرك', 'نهارا']);
+});
+
+test('a non-English SOP retrieves and grounds instead of stripping to noise', async () => {
+  const ar = [{ text: 'القافلة تتحرك نهارا فقط مع حراسة مسلحة', source: 'SOP-AR' }];
+  const top = await doctrineRetriever(ar)('متى تتحرك القافلة نهارا', 5);
+  assert.equal(top[0].source, 'SOP-AR');
+  assert.ok(top[0].score > 0);
+  assert.ok(checkGrounding('القافلة تتحرك نهارا', ar).score > 0);
+});
+
+test('grounding is stem-tolerant across inflection', () => {
+  assert.equal(stem('convoys'), 'convoy');
+  assert.equal(stem('moves'), 'move');
+  assert.equal(stem('escorting'), 'escort');
+  assert.equal(stem('passes'), 'pass');
+  // plural/singular drift still counts as the same grounded evidence
+  assert.equal(checkGrounding('the convoys and escorts', [{ text: 'convoy escort' }]).score, 1);
+});
+
+// ── HARDENING: empty doctrine refuses (does not throw) ─────────────────────────
+test('respond refuses (not throws) on an empty doctrine array — nothing is permitted', async () => {
+  const r = await respond({ persona: 'a cell', doctrine: [], situation: 'do anything' });
+  assert.equal(r.inDoctrine, false);
+  assert.equal(r.errored, false);
+  assert.equal(r.note, 'out_of_doctrine');
+  // still throws when neither doctrine nor retriever is provided at all
+  await assert.rejects(() => respond({ persona: 'p', situation: 'x' }), TypeError);
+});
+
+// ── HARDENING: k validation ────────────────────────────────────────────────────
+test('respond errors (contract action) on an invalid k instead of silently retrieving 0', async () => {
+  for (const bad of [NaN, 'five', -1, Infinity]) {
+    const r = await respond({ persona: 'a cell', doctrine, situation: 'a supply convoy at night', k: bad });
+    assert.equal(r.errored, true, String(bad));
+    assert.equal(r.note, 'invalid_k', String(bad));
+    assert.equal(r.action, 'No action taken.', String(bad));
+  }
+});
+
+// ── HARDENING: strict gate enforcement ─────────────────────────────────────────
+test('strict mode refuses an empty action even if the leftover text looks grounded', () => {
+  const empty = { action: '   ', rationale: 'convoys move only during daylight with an armed escort', used: [1] };
+  assert.equal(groundResponse(empty, passages).inDoctrine, true); // permissive default keeps it
+  const strict = groundResponse(empty, passages, { strict: true });
+  assert.equal(strict.inDoctrine, false);
+  assert.equal(strict.note, 'weak_grounding');
+});
+
+// ── HARDENING: per-case isolation ──────────────────────────────────────────────
+test('benchmark isolates a throwing case and still scores the rest', async () => {
+  const flakyJudge = async ({ situation }) => {
+    if (situation.includes('boom')) throw new Error('judge exploded');
+    return { verdict: 'in-doctrine' };
+  };
+  const doc = [{ text: 'supply convoys move only during daylight with an armed escort', source: 'SOP 3.1' }];
+  const agentChat = async () => ({ action: 'hold the convoy until daylight with an armed escort', rationale: 'per [1]', used: [1] });
+  const { report, runs } = await benchmark(
+    [
+      { id: 'ok1', situation: 'a supply convoy at night', expect: 'hold until daylight' },
+      { id: 'bad', situation: 'boom a supply convoy', expect: 'hold until daylight' },
+      { id: 'ok2', situation: 'an armed escort for the convoy', expect: 'assign escort' },
+    ],
+    { persona: 'a cell', doctrine: doc, chat: agentChat, judge: flakyJudge },
+  );
+  assert.equal(runs.length, 3); // the throw did not abort the run
+  assert.equal(report.n, 3);
+  assert.equal(report.errored, 1);
+  assert.equal(report.scored, 2);
+  assert.equal(report.conforming, 2);
+  assert.equal(report.fidelity, 1); // 2/2 scored conform; the errored case is excluded
+  assert.equal(runs.find((r) => r.id === 'bad').errored, true);
+});
+
+// ── HARDENING: injectable chat (respond model path is testable, no network) ────
+test('respond runs the full model path with an injected chat and grounds the decision', async () => {
+  const cannedChat = async (system) => {
+    assert.match(system, /Act STRICTLY/); // it really reached the model path
+    return { action: 'Hold the convoy until daylight and assign an armed escort.', rationale: 'per [1]', used: [1], outOfDoctrine: false };
+  };
+  const r = await respond({ persona: 'a logistics cell', doctrine, situation: 'a supply convoy at night', chat: cannedChat });
+  assert.equal(r.inDoctrine, true);
+  assert.equal(r.errored, false);
+  assert.ok(r.grounding.score > 0);
+  assert.equal(r.citations[0].source, 'SOP 3.1');
+});
+
+test('scoreCase judges only the cited retrieved subset it is handed, via an injected chat', async () => {
+  let seen = '';
+  const judgeChat = async (system, user) => {
+    seen = user;
+    return { verdict: 'in-doctrine', reasons: 'ok' };
+  };
+  const r = await scoreCase({
+    situation: 's', response: 'hold the convoy', rationale: 'per [1]', expect: 'hold',
+    citations: [{ text: 'convoys move only during daylight' }], chat: judgeChat,
+  });
+  assert.equal(r.verdict, 'in-doctrine');
+  assert.equal(r.errored, false);
+  assert.match(seen, /convoys move only during daylight/);
+  assert.match(seen, /Agent rationale: per \[1\]/); // the rationale is fed to the judge
 });
