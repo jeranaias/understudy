@@ -1,0 +1,17 @@
+{
+  "name": "understudy",
+  "version": "0.1.0",
+  "description": "An agent that stands in for a scarce subject-matter expert — acting strictly within a body of doctrine, with a fidelity benchmark to prove it.",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "src/index.js",
+  "exports": { ".": "./src/index.js", "./benchmark": "./src/benchmark.js" },
+  "keywords": ["agent", "doctrine", "grounded", "role-play", "benchmark", "verification", "llm"],
+  "author": "jeranaias",
+  "engines": { "node": ">=18" },
+  "repository": { "type": "git", "url": "git+https://github.com/jeranaias/understudy.git" },
+  "homepage": "https://github.com/jeranaias/understudy#readme",
+  "bugs": "https://github.com/jeranaias/understudy/issues",
+  "files": ["src", "example"],
+  "scripts": { "test": "node --test" }
+}
